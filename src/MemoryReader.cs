@@ -8,7 +8,7 @@
 //   * wrapped in the RealmForge namespace;
 //   * L() also forwards each log line to OnLog (progress in the window);
 //   * Run() records LastError / LastOpenError so the window can show a clear message;
-//   * meta.extractor comes from ExtractorVersion ("0.6"); meta.gameVersion is added when known.
+//   * meta.extractor comes from ExtractorVersion ("0.8"); meta.gameVersion is added when known.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -25,7 +25,7 @@ namespace RealmForge {
     static IntPtr H;
     public static StringBuilder Log = new StringBuilder();
     // --- v0.5 hooks (the scanning logic below is unchanged from v0.4) ---
-    public const string ExtractorVersion = "0.6";
+    public const string ExtractorVersion = "0.8";
     public static Action<string> OnLog;        // called for every log line (from the worker thread)
     public static string GameVersion;          // written to meta.gameVersion when not null
     public static string LastError;            // "not_running" | "open_failed" | null

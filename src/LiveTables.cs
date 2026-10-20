@@ -22,6 +22,8 @@ namespace RealmForge {
     public ulong EquipData, HeroData, CampOwner, ArtOwner, BeastOwner, ActOwner, Form, Panel;
     public ulong ItemData, PlayerData;   // the bag (ItemData) and the currencies (PlayerData): "resources"
     public ulong UnionWeekBoss;          // UnionWeekBossData: the gear saved with the Zerbus teams (m_SavedTeamEquipsInfo)
+    public ulong PlanList;               // vGroupStoreInfos: saved hero equipment plans (name, id, hero count)
+    public List<ulong> PlanDetails;      // CmdGroupStoreInfo copies that still hold each hero's gear and artifact
     public ulong GameData;               // GameData: its frame counter (m_Knock) moves while the game runs
     public ulong State;                  // the script state (login) the tables belong to: the address of its instance id key; 0 = not known
     public bool Ambiguous;               // memory holds the tables of several logins and the running one could not be told
@@ -330,7 +332,7 @@ namespace RealmForge {
 
     static LiveTables FindLive(int pid) {
       regs = Regions();
-      string[] anchors = { KEquipData, KHero, KHeroes, KCamp, KArts, KBeasts, KAct, KGrid, KPanel, KItems, KPlayer, KZerbus, KGameData };
+      string[] anchors = { KEquipData, KHero, KHeroes, KCamp, KArts, KBeasts, KAct, KGrid, KPanel, KItems, KPlayer, KZerbus, KGameData, KPlanList, KPlanHeroes };
       var tstr = FindLuaStringsFast(anchors);
       var found = new List<string>(); foreach (var kv in tstr) found.Add(kv.Value + "@" + kv.Key.ToString("X"));
       L("Strings found: " + string.Join(", ", found.ToArray()));
@@ -358,6 +360,8 @@ namespace RealmForge {
       lt.ItemData = BestItemData(owners);
       lt.PlayerData = Largest(owners, KPlayer);
       lt.UnionWeekBoss = Largest(owners, KZerbus);
+      lt.PlanList = BestPlanList(owners);
+      lt.PlanDetails = PlanDetailTables(owners);
       if (lt.PlayerData == 0 || !HasNum(lt.PlayerData, "m_Coin")) lt.PlayerData = lt.BeastOwner;
       // the hero screen: the one the game's window list holds (a dead copy of an older one can own the keys too)
       lt.Form = FindFormNode();
@@ -707,10 +711,12 @@ namespace RealmForge {
       L("  summon: " + summon.Count + " parts" + (summon.ContainsKey("pools") ? "" : " (no pools)"));
       sb.Append(",\n\"summon\":"); J(sb, summon);
       // resources: item id -> count, from the bag and the player's currencies
-      Dictionary<string, object> resMeta;
-      var resMap = ReadResources(lt, out resMeta);
-      L("  resources: " + (resMap == null ? "not found" : resMap.Count + " ids"));
+      Dictionary<string, object> resMeta, resNames;
+      var resMap = ReadResources(lt, out resMeta, out resNames);
+      L("  resources: " + (resMap == null ? "not found" : resMap.Count + " ids")
+        + ", named: " + (resNames == null ? 0 : resNames.Count));
       sb.Append(",\n\"resources\":"); J(sb, resMap);
+      sb.Append(",\n\"resourceNames\":"); J(sb, resNames);
       sb.Append(",\n\"resourcesMeta\":"); J(sb, resMeta);
       // Zerbus: each team's saved gear (stage -> [{uiHeroId, vEquipUid, ulArtifactUid, ...}]) and power (UnionWeekBossData
       // SetSavedTeamEquipsBoss3 / _Handler_Union_SaveEquipPlan_SC); present once the game got the guild's boss data
@@ -722,6 +728,14 @@ namespace RealmForge {
         L("  zerbus saved gear: " + (zer.ContainsKey("teams") ? "read" : "none"));
         sb.Append(",\n\"zerbusSaved\":"); J(sb, zer);
       }
+      var equipPlans = ReadEquipPlans(lt);
+      int planN = 0, planGear = 0;
+      foreach (var kv in equipPlans) {
+        var p = kv.Value as Dictionary<string, object>; if (p == null) continue;
+        planN++; if (p.ContainsKey("vHeroInfos")) planGear++;
+      }
+      L("  equip plans: " + planN + ", with gear: " + planGear);
+      sb.Append(",\n\"equipPlans\":"); J(sb, equipPlans);
       // boss fights captured at their result screens (src/BattleCapture.cs): the site compares them with its simulation
       sb.Append(",\n\"battles\":").Append(BattlesJson());
       sb.Append("\n,\"meta\":{\"extractor\":\"" + ExtractorVersion + "\"");
@@ -787,6 +801,74 @@ namespace RealmForge {
     const string KItems = "m_HeroBaseId2ItemId", KPlayer = "m_mNegSpecialItem";
     // UnionWeekBossData (the guild's weekly bosses): the third (Zerbus, two teams) fights with the gear saved with each team
     const string KZerbus = "m_SavedTeamEquipsInfo";
+    // Hero equipment plans (CmdGroupStoreSimpleInfo / CmdGroupStoreInfo). The list is the names and the hero counts.
+    // The gear of each hero stays in memory on the plan that was opened (vHeroInfos); the others keep the count only.
+    const string KPlanList = "vGroupStoreInfos", KPlanHeroes = "vHeroInfos";
+
+    static bool IsSimplePlan(Dictionary<string, object> d) {
+      if (d == null) return false;
+      object name, num, id;
+      return d.TryGetValue("sGroupInfoName", out name) && name is string
+          && d.TryGetValue("uiMemberNum", out num) && num is long
+          && d.TryGetValue("uiGroupId", out id);
+    }
+
+    /// <summary>The live list of equipment plans: the vGroupStoreInfos whose rows are names and hero counts, not the
+    /// struct schema that uses the same key.</summary>
+    static ulong BestPlanList(Dictionary<string, List<ulong>> owners) {
+      List<ulong> l; if (!owners.TryGetValue(KPlanList, out l)) return 0;
+      ulong best = 0; int bestN = -1;
+      foreach (var t in l) {
+        ulong v; int tt; if (!Field(t, KPlanList, out v, out tt) || tt != T_TABLE) continue;
+        var d = ParseTable(v, 2, new HashSet<ulong>()); if (d == null) continue;
+        int n = 0; foreach (var kv in d) if (IsSimplePlan(kv.Value as Dictionary<string, object>)) n++;
+        if (n > bestN) { bestN = n; best = v; }
+      }
+      return best;
+    }
+
+    static bool IsDetailPlan(ulong t) {
+      ulong v; int tt; long id;
+      if (!Field(t, "uiGroupId", out v, out tt) || !AsLong(v, tt, out id) || id <= 0) return false;
+      if (!Field(t, "sGroupInfoName", out v, out tt) || (tt != T_SSTR && tt != T_LSTR)) return false;
+      ulong heroes; int ht;
+      if (!Field(t, KPlanHeroes, out heroes, out ht) || ht != T_TABLE) return false;
+      foreach (var h in TableValues(heroes)) { ulong uid; int ut; if (Field(h, "uiHeroUid", out uid, out ut)) return true; }
+      return false;
+    }
+
+    /// <summary>One full plan per group id (hero uid, artifact, five gear uids). Copies of the same id keep the first.</summary>
+    static List<ulong> PlanDetailTables(Dictionary<string, List<ulong>> owners) {
+      var r = new List<ulong>(); var seen = new HashSet<long>();
+      List<ulong> l; if (!owners.TryGetValue(KPlanHeroes, out l)) return r;
+      foreach (var t in l) {
+        if (!IsDetailPlan(t)) continue;
+        ulong v; int tt; long id;
+        if (!Field(t, "uiGroupId", out v, out tt) || !AsLong(v, tt, out id) || !seen.Add(id)) continue;
+        r.Add(t);
+      }
+      return r;
+    }
+
+    /// <summary>The saved equipment plans. Each row is the list entry (name, group id, hero count, pin time). vHeroInfos
+    /// is added when that plan's gear is still in memory.</summary>
+    static Dictionary<string, object> ReadEquipPlans(LiveTables lt) {
+      var list = new Dictionary<string, object>();
+      if (lt.PlanList != 0) {
+        var d = ParseTable(lt.PlanList, 2, new HashSet<ulong>());
+        if (d != null) foreach (var kv in d) if (IsSimplePlan(kv.Value as Dictionary<string, object>)) list[kv.Key] = kv.Value;
+      }
+      if (lt.PlanDetails != null) foreach (var t in lt.PlanDetails) {
+        var d = ParseTable(t, 4, new HashSet<ulong>()); if (d == null) continue;
+        long id = LNum(d, "uiGroupId"); if (id <= 0 || !d.ContainsKey(KPlanHeroes)) continue;
+        foreach (var kv in list) {
+          var p = kv.Value as Dictionary<string, object>; if (p == null || LNum(p, "uiGroupId") != id) continue;
+          p[KPlanHeroes] = d[KPlanHeroes];
+          break;
+        }
+      }
+      return list;
+    }
 
     // PlayerData scalar fields -> item id (CurrencyType; ItemData:GetItemNumById)
     static readonly KeyValuePair<string, long>[] PlayerCurrencies = {
@@ -854,13 +936,69 @@ namespace RealmForge {
       return false;
     }
 
+    static void PutResourceName(SortedDictionary<long, string> names, long id, string name) {
+      if (id <= 0 || string.IsNullOrEmpty(name) || names.ContainsKey(id)) return;
+      names[id] = name;
+    }
+
+    /// <summary>A display name on a config table. The bag item is {m_Config, m_Count}; the title is not always on the
+    /// top table (artifacts keep it on a nested config).</summary>
+    static string ResourceTitle(ulong table) {
+      string[] keys = { "m_mName", "m_Name", "m_ItemName", "m_sName" };
+      foreach (var key in keys) {
+        ulong v; int tt;
+        if (!Field(table, key, out v, out tt) || (tt != T_SSTR && tt != T_LSTR)) continue;
+        var s = ReadLuaString(v);
+        if (!string.IsNullOrEmpty(s)) return s;
+      }
+      return null;
+    }
+
+    static string ItemConfigTitle(ulong item) {
+      ulong cfg; int tt;
+      if (!Field(item, "m_Config", out cfg, out tt) || tt != T_TABLE) return null;
+      string name = ResourceTitle(cfg);
+      if (name != null) return name;
+      string[] nested = { "m_ItemCfg", "m_AfCfg", "m_Cfg" };
+      foreach (var key in nested) {
+        ulong child; int ct;
+        if (Field(cfg, key, out child, out ct) && ct == T_TABLE) {
+          name = ResourceTitle(child);
+          if (name != null) return name;
+        }
+      }
+      return null;
+    }
+
+    static void LogConfigSample(long id, ulong item, ref bool logged) {
+      if (logged) return;
+      ulong cfg; int tt;
+      if (!Field(item, "m_Config", out cfg, out tt) || tt != T_TABLE) return;
+      var d = ParseTable(cfg, 0, new HashSet<ulong>());
+      if (d == null) return;
+      logged = true;
+      var sample = new StringBuilder();
+      foreach (var kv in d) {
+        if (sample.Length > 400) { sample.Append(" ..."); break; }
+        if (sample.Length > 0) sample.Append(", ");
+        sample.Append(kv.Key);
+        var s = kv.Value as string;
+        if (s != null && s != "<table>" && s.Length > 0 && s.Length <= 48) sample.Append("=").Append(s);
+      }
+      L("  item config sample id " + id + ": " + sample);
+    }
+
     /// <summary>The player's resources: item id -> count. The bag (ItemData.m_Items, plus m_TimeItems summed), then the
     /// currencies of PlayerData, which win as in ItemData:GetItemNumById (scalars, m_SpecialItem, m_mNegSpecialItem).
-    /// Null when neither table is known; <paramref name="meta"/> says what was found.</summary>
-    internal static Dictionary<string, object> ReadResources(LiveTables lt, out Dictionary<string, object> meta) {
+    /// <paramref name="names"/> is item id -> display name when the config has one. The seven PlayerData scalars use
+    /// the names already fixed in <see cref="PlayerCurrencies"/> when the bag has no title for that id.
+    /// Null counts when neither table is known; <paramref name="meta"/> says what was found.</summary>
+    internal static Dictionary<string, object> ReadResources(LiveTables lt, out Dictionary<string, object> meta, out Dictionary<string, object> namesOut) {
       meta = new Dictionary<string, object>();
+      namesOut = new Dictionary<string, object>();
       var counts = new SortedDictionary<long, long>();
-      bool bag = false, player = false; int types = 0;
+      var names = new SortedDictionary<long, string>();
+      bool bag = false, player = false, logged = false; int types = 0;
 
       ulong m; int mt;
       if (lt.ItemData != 0 && Field(lt.ItemData, "m_Items", out m, out mt) && mt == T_TABLE) {
@@ -873,6 +1011,8 @@ namespace RealmForge {
             ulong c; int ct; long n;
             if (!Field(it.Val, "m_Count", out c, out ct) || !AsLong(c, ct, out n) || n == 0) continue;
             long old; counts.TryGetValue(it.Key, out old); counts[it.Key] = old + n;
+            PutResourceName(names, it.Key, ItemConfigTitle(it.Val));
+            LogConfigSample(it.Key, it.Val, ref logged);
           }
         }
         ulong ti; int tit;
@@ -902,10 +1042,19 @@ namespace RealmForge {
         }
       }
 
+      if (counts.ContainsKey(1)) names[1] = "Gold";
+      if (counts.ContainsKey(2)) names[2] = "Commander EXP";
+      if (counts.ContainsKey(3)) names[3] = "Stamina";
+      if (counts.ContainsKey(4)) names[4] = "Diamond";
+      if (counts.ContainsKey(5)) names[5] = "Hero EXP Potion";
+      if (counts.ContainsKey(16)) names[16] = "Talent Point";
+      if (counts.ContainsKey(39)) names[39] = "Friend Heart";
+
       meta["bag"] = bag; meta["player"] = player; meta["types"] = (long)types;
       if (!bag && !player) return null;
       var res = new Dictionary<string, object>();
       foreach (var kv in counts) res[kv.Key.ToString(System.Globalization.CultureInfo.InvariantCulture)] = kv.Value;
+      foreach (var kv in names) namesOut[kv.Key.ToString(System.Globalization.CultureInfo.InvariantCulture)] = kv.Value;
       return res;
     }
   }
