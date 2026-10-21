@@ -24,6 +24,7 @@ namespace RealmForge {
     public ulong UnionWeekBoss;          // UnionWeekBossData: the gear saved with the Zerbus teams (m_SavedTeamEquipsInfo)
     public ulong PlanList;               // vGroupStoreInfos: saved hero equipment plans (name, id, hero count)
     public List<ulong> PlanDetails;      // CmdGroupStoreInfo copies that still hold each hero's gear and artifact
+    public List<ulong> TradingOrders;    // this week's Trading Hall orders (tables with vCost of harbor items)
     public ulong GameData;               // GameData: its frame counter (m_Knock) moves while the game runs
     public ulong State;                  // the script state (login) the tables belong to: the address of its instance id key; 0 = not known
     public bool Ambiguous;               // memory holds the tables of several logins and the running one could not be told
@@ -332,7 +333,7 @@ namespace RealmForge {
 
     static LiveTables FindLive(int pid) {
       regs = Regions();
-      string[] anchors = { KEquipData, KHero, KHeroes, KCamp, KArts, KBeasts, KAct, KGrid, KPanel, KItems, KPlayer, KZerbus, KGameData, KPlanList, KPlanHeroes };
+      string[] anchors = { KEquipData, KHero, KHeroes, KCamp, KArts, KBeasts, KAct, KGrid, KPanel, KItems, KPlayer, KZerbus, KGameData, KPlanList, KPlanHeroes, "vCost" };
       var tstr = FindLuaStringsFast(anchors);
       var found = new List<string>(); foreach (var kv in tstr) found.Add(kv.Value + "@" + kv.Key.ToString("X"));
       L("Strings found: " + string.Join(", ", found.ToArray()));
@@ -367,7 +368,65 @@ namespace RealmForge {
       lt.Form = FindFormNode();
       if (lt.Form == 0 && owners.TryGetValue(KGrid, out l)) foreach (var t in l) if (HasTable(t, "m_InfinityGridProxy")) { lt.Form = t; break; }
       if (owners.TryGetValue(KPanel, out l)) foreach (var t in l) if (HasTable(t, KList) && HasTable(t, "m_Form")) { lt.Panel = t; break; }
+      lt.TradingOrders = HarborOrders(owners);
       return lt;
+    }
+
+    // This week's Trading Hall board. vCost owners that spend a harbor ingredient (60011–60019). Copies of the same
+    // order stay in memory; one table per cost+reward pair. The board is not in the fast item maps, so it rides the
+    // same anchor scan as the rest of the account.
+    static List<ulong> HarborOrders(Dictionary<string, List<ulong>> owners) {
+      var list = new List<ulong>();
+      var seen = new HashSet<string>();
+      List<ulong> tables;
+      if (owners == null || !owners.TryGetValue("vCost", out tables)) { L("  trading hall orders: 0"); return list; }
+      foreach (var t in tables) {
+        if (!HasHarborCost(t)) continue;
+        var d = ParseTable(t, 3, new HashSet<ulong>());
+        if (d == null || !d.ContainsKey("vReward")) continue;
+        string sig = OrderSig(d, "vCost") + ">" + OrderSig(d, "vReward");
+        if (!seen.Add(sig)) continue;
+        list.Add(t);
+      }
+      L("  trading hall orders: " + list.Count);
+      return list;
+    }
+
+    static bool HasHarborCost(ulong order) {
+      ulong cost, reward; int ct, rt;
+      if (!Field(order, "vCost", out cost, out ct) || ct != T_TABLE) return false;
+      if (!Field(order, "vReward", out reward, out rt) || rt != T_TABLE) return false;
+      foreach (var item in TableValues(cost)) {
+        ulong id; int it;
+        if (Field(item, "iID", out id, out it) && it == T_INT && (long)id >= 60011 && (long)id <= 60019) return true;
+      }
+      return false;
+    }
+
+    static string OrderSig(Dictionary<string, object> order, string key) {
+      object v; if (!order.TryGetValue(key, out v)) return "";
+      var rows = v as Dictionary<string, object>; if (rows == null) return "";
+      var bits = new List<string>();
+      foreach (var kv in rows) {
+        var row = kv.Value as Dictionary<string, object>; if (row == null) continue;
+        object id, num;
+        if (!row.TryGetValue("iID", out id) || !row.TryGetValue("iNum", out num)) continue;
+        bits.Add(id + "x" + num);
+      }
+      bits.Sort(StringComparer.Ordinal);
+      return string.Join(",", bits.ToArray());
+    }
+
+    static Dictionary<string, object> TradingHall(LiveTables lt) {
+      var hall = new Dictionary<string, object>();
+      if (lt.TradingOrders == null) return hall;
+      int n = 0;
+      foreach (var t in lt.TradingOrders) {
+        var d = ParseTable(t, 3, new HashSet<ulong>());
+        if (d == null) continue;
+        hall["[" + (++n) + "]"] = d;
+      }
+      return hall;
     }
 
     // the owner of the key whose value (a table) has the most entries
@@ -736,6 +795,7 @@ namespace RealmForge {
       }
       L("  equip plans: " + planN + ", with gear: " + planGear);
       sb.Append(",\n\"equipPlans\":"); J(sb, equipPlans);
+      sb.Append(",\n\"tradingHall\":"); J(sb, TradingHall(lt));
       // boss fights captured at their result screens (src/BattleCapture.cs): the site compares them with its simulation
       sb.Append(",\n\"battles\":").Append(BattlesJson());
       sb.Append("\n,\"meta\":{\"extractor\":\"" + ExtractorVersion + "\"");
